@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -16,6 +17,7 @@ import (
 	"github.com/go-chi/metrics"
 	"github.com/juanfont/headscale/hscontrol/capver"
 	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/juanfont/headscale/hscontrol/util/zlog/zf"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"golang.org/x/net/http2"
@@ -163,8 +165,6 @@ func (h *Headscale) NoiseUpgradeHandler(
 	r.Use(middleware.RequestLogger(&zerologRequestLogger{}))
 	r.Use(middleware.Recoverer)
 
-	r.Handle("/metrics", metrics.Handler())
-
 	r.Route("/machine", func(r chi.Router) {
 		r.Post("/register", ns.RegistrationHandler)
 		r.Post("/map", ns.PollNetMapHandler)
@@ -207,11 +207,7 @@ func (h *Headscale) NoiseUpgradeHandler(
 		r.Post("/c2n", ns.NotImplementedHandler)
 	})
 
-	ns.httpBaseConfig = &http.Server{
-		Handler:           r,
-		ReadHeaderTimeout: types.HTTPTimeout,
-	}
-	ns.http2Server = &http2.Server{}
+	ns.httpBaseConfig, ns.http2Server = newNoiseHTTPServers(r, types.HTTPTimeout)
 
 	ns.http2Server.ServeConn(
 		noiseConn,
@@ -219,6 +215,23 @@ func (h *Headscale) NoiseUpgradeHandler(
 			BaseConfig: ns.httpBaseConfig,
 		},
 	)
+}
+
+// newNoiseHTTPServers builds the servers for one Noise tunnel. The hijack
+// drops the outer server's deadlines and any machine key gets a tunnel, so
+// this is where a stalled request body (ReadTimeout) and a tunnel with no open
+// stream (IdleTimeout) are bounded. WriteTimeout stays unset: it would cut
+// long polls and a follow-up waiting for its registration. ServeConn takes the
+// idle timeout from the [http2.Server], not from BaseConfig.
+func newNoiseHTTPServers(
+	handler http.Handler,
+	timeout time.Duration,
+) (*http.Server, *http2.Server) { //nolint:staticcheck // 0.29 serves tunnels via http2.ServeConn
+	return &http.Server{
+		Handler:           handler,
+		ReadHeaderTimeout: timeout,
+		ReadTimeout:       timeout,
+	}, &http2.Server{IdleTimeout: timeout} //nolint:staticcheck // see above
 }
 
 func unsupportedClientError(version tailcfg.CapabilityVersion) error {
@@ -575,10 +588,13 @@ func (ns *noiseServer) sshActionHoldAndDelegate(
 		)
 	}
 
-	ns.headscale.state.SetAuthCacheEntry(
+	err = ns.headscale.state.SetAuthCacheEntry(
 		authID,
 		types.NewSSHCheckAuthRequest(srcNodeID, dstNodeID),
 	)
+	if err != nil {
+		return nil, authAdmissionError(err)
+	}
 
 	authURL := ns.headscale.authProvider.AuthURL(authID)
 
@@ -608,8 +624,9 @@ func (ns *noiseServer) sshActionHoldAndDelegate(
 }
 
 // sshActionFollowUp handles follow-up requests where the client
-// provides an auth_id. It blocks until the auth session resolves or
-// the request context is cancelled (e.g. the client disconnects).
+// provides an auth_id. It blocks until the auth session resolves, the
+// request context is cancelled (e.g. the client disconnects), or a newer
+// follow-up parks on the session.
 func (ns *noiseServer) sshActionFollowUp(
 	ctx context.Context,
 	reqLog zerolog.Logger,
@@ -673,6 +690,8 @@ func (ns *noiseServer) sshActionFollowUp(
 
 	reqLog.Trace().Caller().Msg("SSH action follow-up")
 
+	superseded := auth.Park()
+
 	var (
 		verdict   types.AuthVerdict
 		verdictOK bool
@@ -690,8 +709,14 @@ func (ns *noiseServer) sshActionFollowUp(
 			"ssh action follow-up cancelled",
 			ctx.Err(),
 		)
+	case <-superseded:
+		// The newer request collects the verdict; this one re-delegates, as
+		// it would on a consumed verdict, without waiting for it.
+		return sessionGone("SSH check follow-up superseded; re-delegating")
 	case verdict, verdictOK = <-auth.WaitForAuth():
 	}
+
+	ns.headscale.state.DeleteAuthCacheEntry(authID)
 
 	// FinishAuth buffers one verdict, then closes the channel. A closed
 	// receive yields the zero verdict, which Accept() reports as success,
@@ -788,6 +813,42 @@ func (ns *noiseServer) PollNetMapHandler(
 		return
 	}
 
+	// Keep preferred endpoints first; clients retry rejected reports unchanged.
+	count := min(len(mapRequest.Endpoints), types.MaxEndpoints)
+	mapRequest.Endpoints = slices.Clone(mapRequest.Endpoints[:count])
+
+	mapRequest.EndpointTypes = slices.Clone(mapRequest.EndpointTypes[:min(len(mapRequest.EndpointTypes), types.MaxEndpoints)])
+	for _, endpoint := range mapRequest.Endpoints {
+		if endpoint.Addr().Zone() != "" {
+			httpError(writer, NewHTTPError(http.StatusBadRequest, "endpoint must not include an IPv6 zone", nil))
+			return
+		}
+	}
+
+	if hi := mapRequest.Hostinfo; hi != nil {
+		if len(hi.RoutableIPs) > types.MaxRoutableIPs {
+			log.Warn().Uint64(zf.NodeID, uint64(nv.ID())).Int(zf.RoutableIPCount, len(hi.RoutableIPs)).
+				Msgf("client announced too many routes, keeping the first %d", types.MaxRoutableIPs)
+			hi.RoutableIPs = hi.RoutableIPs[:types.MaxRoutableIPs]
+		}
+
+		if hi.NetInfo != nil {
+			// Latency measurements are not used by the control server.
+			hi.NetInfo.DERPLatency = nil
+		}
+	}
+
+	// Reject before the session, the node or its peers keep the report.
+	err = types.ValidateHostinfo(mapRequest.Hostinfo)
+	if err != nil {
+		httpError(writer, NewHTTPError(http.StatusRequestEntityTooLarge, err.Error(), err))
+		return
+	}
+
+	// A repeated JSON key can leave a short slice backed by a larger array.
+	mapRequest.Hostinfo = mapRequest.Hostinfo.Clone()
+	mapRequest.DebugFlags = nil
+
 	sess := ns.headscale.newMapSession(req.Context(), mapRequest, writer, nv.AsStruct())
 	sess.log.Trace().Caller().Msg("a node sending a MapRequest with Noise protocol")
 
@@ -813,6 +874,7 @@ func (ns *noiseServer) RegistrationHandler(
 		return
 	}
 
+	statusCode := http.StatusOK
 	registerRequest, registerResponse := func() (*tailcfg.RegisterRequest, *tailcfg.RegisterResponse) { //nolint:contextcheck
 		var resp *tailcfg.RegisterResponse
 
@@ -823,9 +885,52 @@ func (ns *noiseServer) RegistrationHandler(
 			return &regReq, regErr(err)
 		}
 
-		resp, err = ns.headscale.handleRegister(req.Context(), regReq, ns.conn.Peer())
+		if regReq.Followup != "" {
+			// Keep only fields used by logout checks or a refreshed registration.
+			var auth *tailcfg.RegisterResponseAuth
+			if regReq.Auth != nil {
+				auth = &tailcfg.RegisterResponseAuth{}
+			}
+
+			regReq = tailcfg.RegisterRequest{
+				Version: regReq.Version, NodeKey: regReq.NodeKey,
+				Followup: regReq.Followup, Expiry: regReq.Expiry,
+				Auth: auth, Hostinfo: registrationDataFromRequest(regReq, ns.machineKey).Hostinfo,
+			}
+		}
+
+		if hi := regReq.Hostinfo; hi != nil {
+			if len(hi.RoutableIPs) > types.MaxRoutableIPs {
+				log.Warn().Str(zf.MachineKey, ns.machineKey.ShortString()).
+					Int(zf.RoutableIPCount, len(hi.RoutableIPs)).
+					Msgf("client announced too many routes, keeping the first %d", types.MaxRoutableIPs)
+				hi.RoutableIPs = hi.RoutableIPs[:types.MaxRoutableIPs]
+			}
+
+			if hi.NetInfo != nil {
+				hi.NetInfo.DERPLatency = nil
+			}
+		}
+
+		// Reject before a pending registration, a waiting follow-up or the node keeps it.
+		err = types.ValidateHostinfo(regReq.Hostinfo)
+		if err != nil {
+			return &regReq, regErr(err)
+		}
+
+		// A waiting follow-up must not retain the decoder's excess slice capacity.
+		regReq.Hostinfo = regReq.Hostinfo.Clone()
+
+		resp, err = ns.headscale.handleRegister(req.Context(), regReq, ns.machineKey)
 		if err != nil {
 			if httpErr, ok := errors.AsType[HTTPError](err); ok {
+				// Keep permanent errors in HTTP 200 so controlclient surfaces RegisterResponse.Error.
+				if httpErr.Code == http.StatusServiceUnavailable {
+					statusCode = http.StatusServiceUnavailable
+
+					writer.Header().Set("Retry-After", "10")
+				}
+
 				resp = &tailcfg.RegisterResponse{
 					Error: httpErr.Msg,
 				}
@@ -845,7 +950,7 @@ func (ns *noiseServer) RegistrationHandler(
 	}
 
 	writer.Header().Set("Content-Type", "application/json; charset=utf-8")
-	writer.WriteHeader(http.StatusOK)
+	writer.WriteHeader(statusCode)
 
 	err := json.NewEncoder(writer).Encode(registerResponse)
 	if err != nil {

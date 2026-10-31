@@ -1,6 +1,7 @@
 package types
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -19,6 +20,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
+	"tailscale.com/tailcfg/nodecap"
 	"tailscale.com/types/key"
 	"tailscale.com/types/views"
 	"tailscale.com/util/dnsname"
@@ -31,6 +33,10 @@ var (
 	ErrNodeUserHasNoName    = errors.New("node user has no name")
 	ErrCannotRemoveAllTags  = errors.New("cannot remove all tags from node")
 	ErrInvalidNodeView      = errors.New("cannot convert invalid NodeView to tailcfg.Node")
+	ErrExpiryOutOfRange     = errors.New(
+		"key expiry is outside the years 0 to 9999 in UTC",
+	)
+	ErrHostinfoTooLarge = errors.New("hostinfo too large")
 )
 
 // RouteFunc is a function that takes a node ID and returns a list of
@@ -635,6 +641,25 @@ func ValidateGivenName(givenName, baseDomain string) error {
 	return nil
 }
 
+// ValidateExpiry returns expiry in UTC, as [tailcfg.Node.KeyExpiry] carries it,
+// or an error when it cannot be sent to clients. [time.Time.MarshalJSON] refuses
+// a year outside [0,9999], failing every map response that carries it. A time
+// that is in range in its own zone can still leave the range in UTC.
+//
+// Callers store the returned value: SQLite writes a time in its own zone and
+// cannot read back a year outside [0,9999], which that zone can reach when UTC
+// does not.
+func ValidateExpiry(expiry time.Time) (time.Time, error) {
+	utc := expiry.UTC()
+	if year := utc.Year(); year < 0 || year > 9999 {
+		return time.Time{}, fmt.Errorf(
+			"%w: %s", ErrExpiryOutOfRange, expiry.Format(time.RFC3339),
+		)
+	}
+
+	return utc, nil
+}
+
 // AnnouncedRoutes returns the list of routes the node announces, as
 // reported by the client in [tailcfg.Hostinfo.RoutableIPs]. Announcement alone
 // does not grant visibility — see [Node.SubnetRoutes] for approval-gated
@@ -714,6 +739,45 @@ func (node *Node) MarshalZerologObject(e *zerolog.Event) {
 	} else if node.UserID != nil {
 		e.Uint(zf.UserID, *node.UserID)
 	}
+}
+
+// ValidateHostinfo checks the report before it is retained or sent to peers.
+// Routes have a count limit; their encoded size depends on the address family.
+// NetInfo has a separate budget because omitted NetInfo preserves the old value.
+func ValidateHostinfo(hi *tailcfg.Hostinfo) error {
+	if hi == nil {
+		return nil
+	}
+
+	if len(hi.Hostname) > MaxHostnameLength {
+		return fmt.Errorf("%w: hostname exceeds %d bytes", ErrHostinfoTooLarge, MaxHostnameLength)
+	}
+
+	if len(hi.RoutableIPs) > MaxRoutableIPs {
+		return fmt.Errorf("%w: more than %d routes", ErrHostinfoTooLarge, MaxRoutableIPs)
+	}
+
+	if len(hi.RequestTags) > MaxRequestTags {
+		return fmt.Errorf("%w: more than %d requested tags", ErrHostinfoTooLarge, MaxRequestTags)
+	}
+
+	// Encoding also counts fields added upstream without a local field list.
+	rest := *hi
+	rest.RoutableIPs = nil
+	rest.NetInfo = nil
+
+	for _, part := range []any{&rest, hi.NetInfo} {
+		encoded, err := json.Marshal(part)
+		if err != nil {
+			return fmt.Errorf("encoding hostinfo: %w", err)
+		}
+
+		if len(encoded) > MaxHostinfoSize {
+			return fmt.Errorf("%w: %d bytes, limit %d", ErrHostinfoTooLarge, len(encoded), MaxHostinfoSize)
+		}
+	}
+
+	return nil
 }
 
 // PeerChangeFromMapRequest takes a [tailcfg.MapRequest] and compares it to the node
@@ -1035,6 +1099,20 @@ func (nv NodeView) IsTagged() bool {
 	return nv.ж.IsTagged()
 }
 
+// ClaimableBy reports whether a login by userID takes this tagged node back
+// as that user's device, rather than adding a device beside it: userID owns
+// or created the key it joined with. Tagging clears a node's user, so a node
+// that joined by login records no former owner and nobody claims it.
+func (nv NodeView) ClaimableBy(userID UserID) bool {
+	if !nv.IsTagged() || nv.RegisterMethod() != util.RegisterMethodAuthKey {
+		return false
+	}
+
+	k := nv.AuthKey()
+
+	return k.Valid() && k.UserID().Valid() && UserID(k.UserID().Get()) == userID
+}
+
 // IsExpired returns whether the node registration has expired.
 func (nv NodeView) IsExpired() bool {
 	if !nv.Valid() {
@@ -1319,7 +1397,7 @@ func (nv NodeView) TailNode(
 		return nil, err
 	}
 
-	var derp int
+	var derp tailcfg.DERPRegionID
 	if nv.Hostinfo().Valid() && nv.Hostinfo().NetInfo().Valid() {
 		derp = nv.Hostinfo().NetInfo().PreferredDERP()
 	}
@@ -1327,6 +1405,13 @@ func (nv NodeView) TailNode(
 	var keyExpiry time.Time
 	if nv.Expiry().Valid() {
 		keyExpiry = nv.Expiry().Get()
+	}
+
+	// Fail here, where the mapper drops just this peer, rather than in
+	// json.Marshal, which fails the whole response.
+	keyExpiry, err = ValidateExpiry(keyExpiry)
+	if err != nil {
+		return nil, err
 	}
 
 	// disable-ipv4 (https://tailscale.com/docs/reference/troubleshooting/network-configuration/cgnat-conflicts)
@@ -1360,8 +1445,9 @@ func (nv NodeView) TailNode(
 	// what Tailscale SaaS emits for a default tailnet.
 	// cfg.Taildrop.Enabled gates CapabilityFileSharing.
 	capMap := tailcfg.NodeCapMap{
-		tailcfg.CapabilityAdmin: []tailcfg.RawMessage{},
-		tailcfg.CapabilitySSH:   []tailcfg.RawMessage{},
+		nodecap.Admin:                   []tailcfg.RawMessage{},
+		nodecap.SSH:                     []tailcfg.RawMessage{},
+		nodecap.SSHEnvironmentVariables: []tailcfg.RawMessage{},
 	}
 
 	if cfg.Taildrop.Enabled {
@@ -1395,7 +1481,7 @@ func (nv NodeView) TailNode(
 		User: nv.TailscaleUserID(),
 
 		Key:       nv.NodeKey(),
-		KeyExpiry: keyExpiry.UTC(),
+		KeyExpiry: keyExpiry,
 
 		Machine:       nv.MachineKey(),
 		DiscoKey:      nv.DiscoKey(),

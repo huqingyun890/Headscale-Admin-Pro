@@ -239,7 +239,7 @@ type DERPConfig struct {
 	ServerEnabled                      bool
 	AutomaticallyAddEmbeddedDerpRegion bool
 	ServerInsecureForTests             bool
-	ServerRegionID                     int
+	ServerRegionID                     tailcfg.DERPRegionID
 	ServerRegionCode                   string
 	ServerRegionName                   string
 	ServerPrivateKeyPath               string
@@ -318,9 +318,9 @@ type Tuning struct {
 	// valid before being eligible for eviction.
 	RegisterCacheExpiration time.Duration
 
-	// RegisterCacheMaxEntries bounds the number of pending registration
-	// entries the auth cache will hold. Older entries are evicted (LRU)
-	// when the cap is reached, preventing unauthenticated cache-fill DoS.
+	// RegisterCacheMaxEntries bounds pending registrations. At capacity, new
+	// registrations are refused without evicting admitted sessions. SSH checks
+	// can also use 64 reserved slots beyond this limit.
 	// A value of 0 falls back to defaultRegisterCacheMaxEntries (1024).
 	RegisterCacheMaxEntries int
 
@@ -399,6 +399,21 @@ func (c *Config) Domain() string {
 	}
 
 	return u.Hostname()
+}
+
+// ServesRoute reports whether an approved route is handed to clients. A
+// single address inside the node ranges, in either spelling, names a node
+// rather than a subnet, so it stays approved but is never served. 4via6
+// addresses stand for a site's IPv4 subnet, not a node.
+func (c *Config) ServesRoute(p netip.Prefix) bool {
+	if !p.IsSingleIP() || tsaddr.IsViaPrefix(p) {
+		return true
+	}
+
+	addr := p.Addr().Unmap()
+
+	return (c.PrefixV4 == nil || !c.PrefixV4.Contains(addr)) &&
+		(c.PrefixV6 == nil || !c.PrefixV6.Contains(addr))
 }
 
 // LoadConfig prepares and loads the Headscale configuration into Viper.
@@ -728,7 +743,7 @@ func tlsConfig() TLSConfig {
 
 func derpConfig() DERPConfig {
 	serverEnabled := viper.GetBool("derp.server.enabled")
-	serverRegionID := viper.GetInt("derp.server.region_id")
+	serverRegionID := viper.GetInt64("derp.server.region_id")
 	serverRegionCode := viper.GetString("derp.server.region_code")
 	serverRegionName := viper.GetString("derp.server.region_name")
 	serverVerifyClients := viper.GetBool("derp.server.verify_clients")
@@ -778,7 +793,7 @@ func derpConfig() DERPConfig {
 
 	return DERPConfig{
 		ServerEnabled:                      serverEnabled,
-		ServerRegionID:                     serverRegionID,
+		ServerRegionID:                     tailcfg.DERPRegionID(serverRegionID),
 		ServerRegionCode:                   serverRegionCode,
 		ServerRegionName:                   serverRegionName,
 		ServerVerifyClients:                serverVerifyClients,
